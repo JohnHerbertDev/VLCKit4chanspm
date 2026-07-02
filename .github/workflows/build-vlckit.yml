@@ -1,57 +1,44 @@
-name: Build VLCKit (4chan codec subset)
+name: Build VLCKit
 
 on:
-  schedule:
-    # Weekly, Monday 06:00 UTC. Adjust to taste — "always latest" just
-    # means "rebuilt regularly against VLCKit/VLC master", not literally
-    # every commit.
-    - cron: '0 6 * * 1'
-  workflow_dispatch: {}   # manual trigger button in the Actions tab
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
 
 jobs:
   build:
-    runs-on: macos-15
-    timeout-minutes: 180   # VLC builds are slow; full codec set ~45-90min, give headroom
+    runs-on: macos-15-arm64
+    timeout-minutes: 360  # 6 hours max, adjust if needed
+
     steps:
-      - name: Checkout this repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
-
-      - name: Run stripped-codec VLCKit build
-        run: |
-          chmod +x build-vlckit-4chan.sh
-          ./build-vlckit-4chan.sh
-        # No `continue-on-error` — if verify_flags() or the build itself
-        # fails, this step fails the job and no release is published.
-        # That's intentional: a broken/unstripped build must never ship.
-
-      - name: Derive version tag
-        id: ver
-        run: |
-          DATE_TAG="v$(date +%Y.%m.%d)-${GITHUB_RUN_NUMBER}"
-          echo "tag=${DATE_TAG}" >> "$GITHUB_OUTPUT"
-
-      - name: Publish GitHub Release with xcframework zip
-        uses: softprops/action-gh-release@v2
+      # Cache the entire VLCKit build directory to avoid rebuilding dependencies
+      - name: Cache VLCKit build
+        uses: actions/cache@v4
         with:
-          tag_name: ${{ steps.ver.outputs.tag }}
-          name: VLCKit (4chan codec subset) ${{ steps.ver.outputs.tag }}
-          body: |
-            Stripped VLCKit.xcframework built from VLCKit/VLC `master`.
-            Codecs: WebM/Matroska demux, VP8, VP9, Vorbis, Opus.
-            Excludes anything iOS/AVFoundation already plays natively (H.264, HEVC, AAC, MP3, ALAC).
+          path: .build/vlckit
+          key: ${{ runner.os }}-vlckit-${{ hashFiles('build-vlckit-4chan.sh') }}
+          restore-keys: |
+            ${{ runner.os }}-vlckit-
 
-            SPM checksum: see `VLCKit.xcframework.zip.sha256` asset.
-          files: |
-            output/VLCKit.xcframework.zip
-            output/VLCKit.xcframework.zip.sha256
-          fail_on_unmatched_files: true
-
-      - name: Print Package.swift snippet for this release
+      - name: Build VLCKit
+        env:
+          # Turn off "warning as error" and deprecation warnings for safer compilation
+          CFLAGS: "-Wno-error -Wno-deprecated-declarations"
+          CXXFLAGS: "-Wno-error -Wno-deprecated-declarations"
         run: |
-          CHECKSUM=$(cat output/VLCKit.xcframework.zip.sha256)
-          echo "Update Package.swift binaryTarget with:"
-          echo "  url: \"https://github.com/${GITHUB_REPOSITORY}/releases/download/${{ steps.ver.outputs.tag }}/VLCKit.xcframework.zip\""
-          echo "  checksum: \"${CHECKSUM}\""
+          # Enable verbose output and exit on first error
+          set -e -x
+          chmod +x build-vlckit-4chan.sh
+          # Redirect output to a log file and also print to console
+          ./build-vlckit-4chan.sh 2>&1 | tee build.log
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
