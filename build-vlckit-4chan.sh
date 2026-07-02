@@ -14,13 +14,10 @@
 # 4chan doesn't accept them): H.264, HEVC, AAC, MP3, ALAC, MP4/MOV demux,
 # subtitles, DVD/BluRay, RTSP/streaming protocols, etc.
 #
-# This always builds against VLCKit `master` and VLC core `master`, so it
-# tracks "latest" on every run. Because codec stripping is done by patching
-# VLC core's ./configure flags (VLCKit's own wrapper has no per-codec
-# flags), this script USED TO FAIL LOUDLY if any required --disable-* flag
-# was rejected. The verification step is now commented out because VLC core
-# module names change often. The flags are still passed to configure, and if
-# they are invalid, the build will fail during configure itself.
+# This always builds against VLCKit `master` (which pins a specific VLC core
+# commit via its submodule). To track VLC core `master` instead, you would
+# need to update the submodule reference – but for a reliable build we use
+# the exact commit that VLCKit expects.
 #
 # Usage:
 #   ./build-vlckit-4chan.sh
@@ -43,10 +40,9 @@ fail() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 # 1. Modules to disable in VLC core's configure.
 #    NOTE: these flag names are tied to VLC core's current configure.ac and
-#    DO change across VLC releases. The verification step was removed because
-#    the names keep changing. After a build, check the actual configure
-#    invocation in the build log to see which flags are accepted and update
-#    this list accordingly.
+#    DO change across VLC releases. The verification step is commented out
+#    because the names keep changing; the flags are still passed to configure.
+#    If the build fails at configure, check the log and update this list.
 # ---------------------------------------------------------------------------
 DISABLE_MODULES=(
   # Native iOS video/audio codecs (AVFoundation already covers these)
@@ -85,17 +81,16 @@ ENABLE_MODULES=(
 CONFIGURE_EXTRA_FLAGS=("${DISABLE_MODULES[@]}" "${ENABLE_MODULES[@]}")
 
 # ---------------------------------------------------------------------------
-# 2. Clone latest VLCKit (which itself pulls VLC core as configured below)
+# 2. Clone latest VLCKit (with its submodule, which provides VLC core)
+#    We use a full clone (no --depth 1) because VLCKit's build script
+#    references specific commits that are not present in shallow clones.
 # ---------------------------------------------------------------------------
 clone_latest() {
   rm -rf "${WORK_DIR}"
   mkdir -p "${WORK_DIR}"
-  log "Cloning VLCKit master..."
-  git clone --depth 1 https://code.videolan.org/videolan/VLCKit.git "${VLCKIT_DIR}"
-
-  log "Cloning VLC core master into libvlc/vlc..."
-  git clone --depth 1 --branch master --single-branch \
-    https://code.videolan.org/videolan/vlc.git "${VLCKIT_DIR}/libvlc/vlc"
+  log "Cloning VLCKit master (with submodules)..."
+  git clone --recursive https://code.videolan.org/videolan/VLCKit.git "${VLCKIT_DIR}"
+  # VLC core is now inside ${VLCKIT_DIR}/libvlc/vlc at the commit VLCKit expects.
 }
 
 # ---------------------------------------------------------------------------
