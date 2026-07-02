@@ -20,7 +20,9 @@ jobs:
         run: sudo xcode-select -s /Applications/Xcode_16.app/Contents/Developer
 
       - name: Run stripped-codec VLCKit build
-        run: ./build-vlckit-4chan.sh
+        run: |
+          chmod +x build-vlckit-4chan.sh
+          ./build-vlckit-4chan.sh
         # No `continue-on-error` — if verify_flags() or the build itself
         # fails, this step fails the job and no release is published.
         # That's intentional: a broken/unstripped build must never ship.
