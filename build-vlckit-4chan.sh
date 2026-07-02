@@ -1,0 +1,186 @@
+#!/usr/bin/env bash
+#
+# build-vlckit-4chan.sh
+#
+# Builds a stripped-down VLCKit.xcframework (iOS device + iOS Simulator,
+# arm64 + x86_64) containing ONLY the codecs 4chan actually accepts that
+# iOS does not already play natively via AVFoundation:
+#
+#   Demux:  WebM / Matroska
+#   Video:  VP8, VP9
+#   Audio:  Vorbis, Opus
+#
+# Explicitly excluded (iOS/AVFoundation already handles these, and/or
+# 4chan doesn't accept them): H.264, HEVC, AAC, MP3, ALAC, MP4/MOV demux,
+# subtitles, DVD/BluRay, RTSP/streaming protocols, etc.
+#
+# This always builds against VLCKit `master` and VLC core `master`, so it
+# tracks "latest" on every run. Because codec stripping is done by patching
+# VLC core's ./configure flags (VLCKit's own wrapper has no per-codec
+# flags), this script FAILS LOUDLY if any required --disable-* flag is
+# rejected by the current VLC configure script, rather than silently
+# producing an unstripped (or broken) build. If that happens, VLC upstream
+# has renamed/removed a module and the DISABLE_MODULES list below needs
+# updating before this will build again.
+#
+# Usage:
+#   ./build-vlckit-4chan.sh
+#
+# Output:
+#   ./output/VLCKit.xcframework
+#   ./output/VLCKit.xcframework.zip
+#   ./output/VLCKit.xcframework.zip.sha256
+#
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+WORK_DIR="${ROOT_DIR}/.build"
+OUT_DIR="${ROOT_DIR}/output"
+VLCKIT_DIR="${WORK_DIR}/vlckit"
+
+log()  { printf '\033[1;34m[build]\033[0m %s\n' "$*"; }
+fail() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# 1. Modules to disable in VLC core's configure.
+#    NOTE: these flag names are tied to VLC core's current configure.ac and
+#    DO change across VLC releases. If a flag below is rejected by configure,
+#    we abort instead of silently building wrong/unstripped output — see
+#    verify_flags() below.
+# ---------------------------------------------------------------------------
+DISABLE_MODULES=(
+  # Native iOS video/audio codecs (AVFoundation already covers these)
+  --disable-x264
+  --disable-x265
+  --disable-mp4
+  --disable-faad
+  --disable-mad        # mp3
+  # Subtitle / container extras 4chan doesn't accept
+  --disable-libass
+  --disable-dvdread
+  --disable-dvdnav
+  --disable-bluray
+  --disable-dca
+  --disable-a52
+  # Network/streaming protocols not needed for local file playback
+  --disable-live555
+  --disable-dsm
+  --disable-smb2
+  --disable-nfs
+  --disable-sftp
+  --disable-ftp
+  --disable-rtsp
+)
+
+# Flags we explicitly want ENABLED — VLC contrib defaults can vary, so be
+# explicit rather than relying on defaults.
+ENABLE_MODULES=(
+  --enable-vpx          # VP8 + VP9 (libvpx)
+  --enable-ogg           # WebM/Matroska + Vorbis/Opus container plumbing
+  --enable-vorbis
+  --enable-opus
+  --enable-matroska
+)
+
+CONFIGURE_EXTRA_FLAGS=("${DISABLE_MODULES[@]}" "${ENABLE_MODULES[@]}")
+
+# ---------------------------------------------------------------------------
+# 2. Clone latest VLCKit (which itself pulls VLC core as configured below)
+# ---------------------------------------------------------------------------
+clone_latest() {
+  rm -rf "${WORK_DIR}"
+  mkdir -p "${WORK_DIR}"
+  log "Cloning VLCKit master..."
+  git clone --depth 1 https://code.videolan.org/videolan/VLCKit.git "${VLCKIT_DIR}"
+
+  log "Cloning VLC core master into libvlc/vlc..."
+  git clone --depth 1 --branch master --single-branch \
+    https://code.videolan.org/videolan/vlc.git "${VLCKIT_DIR}/libvlc/vlc"
+}
+
+# ---------------------------------------------------------------------------
+# 3. Verify every disable/enable flag is actually recognized by THIS
+#    checkout of VLC core's configure script before we commit to a full
+#    build. This is what makes failures loud/early instead of silent.
+# ---------------------------------------------------------------------------
+verify_flags() {
+  local vlc_configure="${VLCKIT_DIR}/libvlc/vlc/configure.ac"
+  [[ -f "${vlc_configure}" ]] || fail "Could not find VLC configure.ac at expected path: ${vlc_configure}"
+
+  log "Verifying codec flags against current VLC core configure.ac..."
+  local missing=()
+  local flag module
+
+  for flag in "${CONFIGURE_EXTRA_FLAGS[@]}"; do
+    # strip --enable-/--disable- prefix to get the module/feature name
+    module="${flag#--enable-}"
+    module="${module#--disable-}"
+    if ! grep -qE "(enable|disable)-${module}" "${vlc_configure}"; then
+      missing+=("${flag} (module: ${module})")
+    fi
+  done
+
+  if (( ${#missing[@]} > 0 )); then
+    fail "$(printf 'The following configure flags are no longer recognized by VLC core master — upstream likely renamed/removed a module. Update DISABLE_MODULES/ENABLE_MODULES in this script before rebuilding:\n  %s\n' "$(printf '%s\n  ' "${missing[@]}")")"
+  fi
+
+  log "All ${#CONFIGURE_EXTRA_FLAGS[@]} codec flags verified OK."
+}
+
+# ---------------------------------------------------------------------------
+# 4. Inject our extra configure flags into VLCKit's build invocation.
+#    VLCKit's compileAndBuildVLCKit.sh forwards $EXTRA_CONFIGURE_FLAGS-style
+#    environment overrides down to extras/package/apple/build.sh -> VLC's
+#    own configure. We pass them via the VLC_EXTRA_CONFIGURE_OPTS env var,
+#    which VLC's apple build.sh appends verbatim to its configure call.
+# ---------------------------------------------------------------------------
+build_xcframework() {
+  cd "${VLCKIT_DIR}"
+
+  export VLC_EXTRA_CONFIGURE_OPTS="${CONFIGURE_EXTRA_FLAGS[*]}"
+  log "VLC_EXTRA_CONFIGURE_OPTS = ${VLC_EXTRA_CONFIGURE_OPTS}"
+
+  # -f  : build full xcframework (device + simulator slices combined)
+  # -a  : architectures — device arm64, plus simulator arm64 + x86_64
+  #       (covers Apple Silicon and Intel Macs running the simulator)
+  log "Building iOS device (arm64)..."
+  ./compileAndBuildVLCKit.sh -f -a aarch64
+
+  log "Building iOS Simulator (arm64 + x86_64)..."
+  ./compileAndBuildVLCKit.sh -f -s -a aarch64
+  ./compileAndBuildVLCKit.sh -f -s -a x86_64
+
+  local built_xcframework="${VLCKIT_DIR}/build/VLCKit.xcframework"
+  [[ -d "${built_xcframework}" ]] || fail "Expected output xcframework not found at ${built_xcframework} — build likely failed upstream."
+
+  mkdir -p "${OUT_DIR}"
+  rm -rf "${OUT_DIR}/VLCKit.xcframework"
+  cp -R "${built_xcframework}" "${OUT_DIR}/VLCKit.xcframework"
+}
+
+# ---------------------------------------------------------------------------
+# 5. Package for SPM (zip + checksum for a binaryTarget remote URL)
+# ---------------------------------------------------------------------------
+package() {
+  cd "${OUT_DIR}"
+  log "Zipping xcframework..."
+  rm -f VLCKit.xcframework.zip
+  zip -r -y -q VLCKit.xcframework.zip VLCKit.xcframework
+
+  log "Computing checksum..."
+  swift package compute-checksum VLCKit.xcframework.zip > VLCKit.xcframework.zip.sha256 \
+    || shasum -a 256 VLCKit.xcframework.zip | awk '{print $1}' > VLCKit.xcframework.zip.sha256
+
+  log "Done."
+  log "  Output:   ${OUT_DIR}/VLCKit.xcframework.zip"
+  log "  Checksum: $(cat VLCKit.xcframework.zip.sha256)"
+}
+
+main() {
+  clone_latest
+  verify_flags
+  build_xcframework
+  package
+}
+
+main "$@"
