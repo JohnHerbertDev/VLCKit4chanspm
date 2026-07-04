@@ -14,10 +14,9 @@
 # 4chan doesn't accept them): H.264, HEVC, AAC, MP3, ALAC, MP4/MOV demux,
 # subtitles, DVD/BluRay, RTSP/streaming protocols, etc.
 #
-# This always builds against VLCKit `master` (which pins a specific VLC core
-# commit via its submodule). To track VLC core `master` instead, you would
-# need to update the submodule reference – but for a reliable build we use
-# the exact commit that VLCKit expects.
+# This always builds against VLCKit `master` and uses the VLC core submodule
+# that VLCKit pins. The build uses a single combined command to create the
+# XCFramework, avoiding conflicts from multiple invocations.
 #
 # Usage:
 #   ./build-vlckit-4chan.sh
@@ -133,15 +132,11 @@ build_xcframework() {
   export VLC_EXTRA_CONFIGURE_OPTS="${CONFIGURE_EXTRA_FLAGS[*]}"
   log "VLC_EXTRA_CONFIGURE_OPTS = ${VLC_EXTRA_CONFIGURE_OPTS}"
 
-  # -f  : build full xcframework (device + simulator slices combined)
-  # -a  : architectures — device arm64, plus simulator arm64 + x86_64
-  #       (covers Apple Silicon and Intel Macs running the simulator)
-  log "Building iOS device (arm64)..."
-  ./compileAndBuildVLCKit.sh -f -a aarch64
-
-  log "Building iOS Simulator (arm64 + x86_64)..."
-  ./compileAndBuildVLCKit.sh -f -s -a aarch64
-  ./compileAndBuildVLCKit.sh -f -s -a x86_64
+  # Build full XCFramework (device + simulator) in one go
+  # -f builds the .xcframework, -s includes simulator slices
+  # It automatically picks arm64 for device and arm64+x86_64 for simulator
+  log "Building full VLCKit.xcframework (device + simulator)..."
+  ./compileAndBuildVLCKit.sh -f -s
 
   local built_xcframework="${VLCKIT_DIR}/build/VLCKit.xcframework"
   [[ -d "${built_xcframework}" ]] || fail "Expected output xcframework not found at ${built_xcframework} — build likely failed upstream."
