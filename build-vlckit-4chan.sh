@@ -89,15 +89,22 @@ clone_latest() {
 #    compileAndBuildVLCKit.sh once per architecture/platform (expecting a
 #    bare VLCKit.framework to appear at $BUILD_DIR/VLCKit.framework each
 #    time), then hand-assembled the slices with `xcodebuild
-#    -create-xcframework`. Current upstream VLCKit (master) no longer works
-#    that way: a single invocation of compileAndBuildVLCKit.sh builds every
-#    device/simulator architecture itself and writes one already-combined
-#    VLCKit.xcframework directly to
-#    ${BUILD_DIR}/iOS/VLCKit.xcframework.
-#    The per-slice approach failed with:
+#    -create-xcframework`. That failed with:
 #      "Framework not found at .../build/VLCKit.framework for slice device"
-#    because that intermediate bare-framework path is never produced.
-#    We now just call the script once and copy its finished output.
+#    because current upstream VLCKit (master) doesn't produce that
+#    intermediate bare-framework path.
+#
+#    A later fix called compileAndBuildVLCKit.sh with no flags at all,
+#    which failed differently: BUILD_FRAMEWORK defaults to "no" in the
+#    upstream script, so it compiles libvlc, prints "all done", and exits
+#    immediately -- it never reaches the code that builds VLCKit.xcframework.
+#
+#    The -f flag is mandatory to actually build the xcframework. With -f
+#    (and the default FARCH="all"), a single invocation builds device
+#    arm64 + simulator arm64 + simulator x86_64 and combines them into one
+#    already-combined VLCKit.xcframework, written to
+#    ${BUILD_DIR}/iOS/VLCKit.xcframework. We just call the script once
+#    (with -f) and copy its finished output.
 # ---------------------------------------------------------------------------
 build_xcframework() {
   # Clean build directory
@@ -109,9 +116,13 @@ build_xcframework() {
   export VLC_EXTRA_CONFIGURE_OPTS="${CONFIGURE_EXTRA_FLAGS[*]}"
   log "Building universal VLCKit.xcframework (device + simulator, arm64 + x86_64)..."
 
-  # No -a/-s flags: this builds every required platform/arch slice
-  # internally and combines them into a single xcframework itself.
-  ./compileAndBuildVLCKit.sh
+  # IMPORTANT: -f is required. Without it, BUILD_FRAMEWORK stays at its
+  # default of "no", and the upstream script exits right after printing
+  # "all done" -- it never reaches the code that builds VLCKit.xcframework
+  # at all. With -f (and the default FARCH="all"), a single invocation
+  # builds device arm64 + simulator arm64 + simulator x86_64 and combines
+  # them into one xcframework itself.
+  ./compileAndBuildVLCKit.sh -f
 
   local xcframework_path="${BUILD_DIR}/iOS/VLCKit.xcframework"
   if [[ ! -d "${xcframework_path}" ]]; then
