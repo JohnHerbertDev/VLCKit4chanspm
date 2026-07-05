@@ -14,10 +14,10 @@
 # 4chan doesn't accept them): H.264, HEVC, AAC, MP3, ALAC, MP4/MOV demux,
 # subtitles, DVD/BluRay, RTSP/streaming protocols, etc.
 #
-# This script builds each architecture slice individually without the `-f`
-# flag, then manually combines them into a single XCFramework. This avoids
-# the conflicts and missing-framework errors seen with the single-command
-# approach.
+# This script invokes VLCKit's own compileAndBuildVLCKit.sh once; that
+# script builds every required device/simulator architecture internally
+# and writes a single already-combined VLCKit.xcframework, which we then
+# copy into ./output and package for SPM.
 #
 # Usage:
 #   ./build-vlckit-4chan.sh
@@ -83,78 +83,39 @@ clone_latest() {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Build a single architecture slice (without -f)
-#    $1 = -s or empty (for simulator/device)
-#    $2 = architecture (aarch64 or x86_64)
-#    Output framework will be in $BUILD_DIR/VLCKit.framework
-#    We'll move it to a unique location after building.
-# ---------------------------------------------------------------------------
-build_slice() {
-  local sim_flag="$1"
-  local arch="$2"
-  local slice_name="$3"   # e.g. "device", "sim-arm64", "sim-x86_64"
-
-  cd "${VLCKIT_DIR}"
-
-  export VLC_EXTRA_CONFIGURE_OPTS="${CONFIGURE_EXTRA_FLAGS[*]}"
-  log "Building slice: ${slice_name} (${arch})"
-
-  # Build without -f
-  if [[ -z "${sim_flag}" ]]; then
-    ./compileAndBuildVLCKit.sh -a "${arch}"
-  else
-    ./compileAndBuildVLCKit.sh -s -a "${arch}"
-  fi
-
-  # The framework is now at $BUILD_DIR/VLCKit.framework
-  local src_fw="${BUILD_DIR}/VLCKit.framework"
-  if [[ ! -d "${src_fw}" ]]; then
-    fail "Framework not found at ${src_fw} for slice ${slice_name}"
-  fi
-
-  # Move to a unique location
-  local dest_fw="${BUILD_DIR}/slices/${slice_name}/VLCKit.framework"
-  mkdir -p "$(dirname "${dest_fw}")"
-  mv "${src_fw}" "${dest_fw}"
-  log "Moved framework to ${dest_fw}"
-}
-
-# ---------------------------------------------------------------------------
-# 4. Build all slices and combine into XCFramework
+# 3. Build the universal XCFramework
+#
+#    NOTE: Earlier versions of this script called
+#    compileAndBuildVLCKit.sh once per architecture/platform (expecting a
+#    bare VLCKit.framework to appear at $BUILD_DIR/VLCKit.framework each
+#    time), then hand-assembled the slices with `xcodebuild
+#    -create-xcframework`. Current upstream VLCKit (master) no longer works
+#    that way: a single invocation of compileAndBuildVLCKit.sh builds every
+#    device/simulator architecture itself and writes one already-combined
+#    VLCKit.xcframework directly to
+#    ${BUILD_DIR}/iOS/VLCKit.xcframework.
+#    The per-slice approach failed with:
+#      "Framework not found at .../build/VLCKit.framework for slice device"
+#    because that intermediate bare-framework path is never produced.
+#    We now just call the script once and copy its finished output.
 # ---------------------------------------------------------------------------
 build_xcframework() {
   # Clean build directory
   rm -rf "${BUILD_DIR}"
-  mkdir -p "${BUILD_DIR}/slices"
+  mkdir -p "${BUILD_DIR}"
 
-  # Build device arm64
-  build_slice "" "aarch64" "device"
+  cd "${VLCKIT_DIR}"
 
-  # Build simulator arm64
-  build_slice "-s" "aarch64" "sim-arm64"
+  export VLC_EXTRA_CONFIGURE_OPTS="${CONFIGURE_EXTRA_FLAGS[*]}"
+  log "Building universal VLCKit.xcframework (device + simulator, arm64 + x86_64)..."
 
-  # Build simulator x86_64
-  build_slice "-s" "x86_64" "sim-x86_64"
+  # No -a/-s flags: this builds every required platform/arch slice
+  # internally and combines them into a single xcframework itself.
+  ./compileAndBuildVLCKit.sh
 
-  # Now combine all slices into one XCFramework
-  log "Creating XCFramework from all slices..."
-  local xcframework_path="${BUILD_DIR}/VLCKit.xcframework"
-
-  # Find all framework paths
-  local frameworks=()
-  while IFS= read -r -d '' fw; do
-    frameworks+=("-framework" "${fw}")
-  done < <(find "${BUILD_DIR}/slices" -name "*.framework" -print0)
-
-  if [[ ${#frameworks[@]} -eq 0 ]]; then
-    fail "No frameworks found to combine"
-  fi
-
-  # Combine
-  xcodebuild -create-xcframework "${frameworks[@]}" -output "${xcframework_path}"
-
+  local xcframework_path="${BUILD_DIR}/iOS/VLCKit.xcframework"
   if [[ ! -d "${xcframework_path}" ]]; then
-    fail "XCFramework creation failed - output not found at ${xcframework_path}"
+    fail "XCFramework not found at ${xcframework_path}"
   fi
 
   # Copy to output directory
