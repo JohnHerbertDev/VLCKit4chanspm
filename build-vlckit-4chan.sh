@@ -39,7 +39,33 @@ log()  { printf '\033[1;34m[build]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
-# 1. Modules to disable in VLC core's configure.
+# 1. Modules to disable / enable.
+#
+#    IMPORTANT: These flags do nothing on their own. An earlier version of
+#    this script exported them as $VLC_EXTRA_CONFIGURE_OPTS, but that
+#    environment variable is never read anywhere in VLCKit's
+#    compileAndBuildVLCKit.sh or in VLC's own extras/package/apple/build.sh
+#    -- it was silently ignored from the very first run, which is why past
+#    builds produced a full ~214 MB unstripped VLCKit instead of the
+#    expected ~25-45 MB.
+#
+#    The mechanism VLC's Apple build scripts actually read is a config
+#    file inside the VLC checkout itself:
+#      extras/package/apple/build.conf
+#    which defines (among others) these per-platform arrays:
+#      VLC_CONTRIB_OPTIONS_IOS   -> forwarded to the contrib bootstrap
+#                                    (controls which 3rd-party libs, e.g.
+#                                    ffmpeg/x264/opencv/protobuf, get BUILT
+#                                    as static libs at all)
+#      VLC_CONFIG_OPTIONS_IOS    -> forwarded to VLC core's ./configure
+#                                    (controls which VLC *modules* get
+#                                    compiled against those libs)
+#      VLC_MODULE_REMOVAL_LIST_IOS -> specific modules stripped after build
+#
+#    See build_xcframework() below for how these are actually applied by
+#    patching build.conf inside the freshly cloned VLC checkout, since
+#    compileAndBuildVLCKit.sh clones VLC itself and there is no supported
+#    way to inject these flags purely via environment variables.
 # ---------------------------------------------------------------------------
 DISABLE_MODULES=(
   --disable-x264
@@ -73,7 +99,7 @@ ENABLE_MODULES=(
 CONFIGURE_EXTRA_FLAGS=("${DISABLE_MODULES[@]}" "${ENABLE_MODULES[@]}")
 
 # ---------------------------------------------------------------------------
-# 2. Clone latest VLCKit (with its submodule)
+# 3. Clone latest VLCKit (with its submodule)
 # ---------------------------------------------------------------------------
 clone_latest() {
   rm -rf "${WORK_DIR}"
@@ -83,7 +109,56 @@ clone_latest() {
 }
 
 # ---------------------------------------------------------------------------
-# 3. Build the universal XCFramework
+# 4. Pre-clone VLC and patch its Apple build config.
+#
+#    compileAndBuildVLCKit.sh clones VLC itself, on demand, partway through
+#    step 5 below -- so extras/package/apple/build.conf does not exist yet
+#    right after clone_latest(). We clone VLC ourselves first, into the
+#    exact path compileAndBuildVLCKit.sh expects (must run AFTER
+#    clone_latest, since that step wipes and recreates the whole work
+#    directory), patch build.conf there, then let compileAndBuildVLCKit.sh
+#    find the checkout already present and skip its own clone.
+#
+#    NOTE (unverified, please confirm against the build log): this assumes
+#    compileAndBuildVLCKit.sh only clones VLC when
+#    ${VLCKIT_DIR}/libvlc/vlc doesn't already exist, which is the
+#    conventional pattern for this kind of wrapper script but has not been
+#    tested end-to-end here. After running, check the log for a line like
+#    "Cloning VLC master" -- if it appears anyway, this pre-clone was
+#    ignored and the patched build.conf may have been overwritten by a
+#    fresh clone.
+# ---------------------------------------------------------------------------
+patch_vlc_build_conf() {
+  local vlc_dir="${VLCKIT_DIR}/libvlc/vlc"
+
+  log "Pre-cloning VLC master so we can patch its Apple build config..."
+  mkdir -p "$(dirname "${vlc_dir}")"
+  git clone --branch master --single-branch https://code.videolan.org/videolan/vlc.git "${vlc_dir}"
+
+  local build_conf="${vlc_dir}/extras/package/apple/build.conf"
+  if [[ ! -f "${build_conf}" ]]; then
+    fail "extras/package/apple/build.conf not found in VLC checkout at ${build_conf} -- VLC upstream may have moved/renamed this file; codec strip cannot be applied"
+  fi
+
+  log "Patching ${build_conf} with codec strip flags..."
+  {
+    echo ""
+    echo "# --- injected by build-vlckit-4chan.sh: codec strip for 4chan subset ---"
+    echo "# Appended (not overwritten) so these override the defaults build.conf"
+    echo "# sets earlier in the file, since bash arrays assigned later win."
+    printf 'VLC_CONFIG_OPTIONS_IOS=(%s)\n' "${CONFIGURE_EXTRA_FLAGS[*]}"
+    echo "export VLC_CONFIG_OPTIONS_IOS"
+    printf 'VLC_CONTRIB_OPTIONS_IOS=(%s)\n' "${DISABLE_MODULES[*]}"
+    echo "export VLC_CONTRIB_OPTIONS_IOS"
+    echo "# --- end injected block ---"
+  } >> "${build_conf}"
+
+  log "Patched build.conf contents (tail):"
+  tail -n 10 "${build_conf}"
+}
+
+# ---------------------------------------------------------------------------
+# 5. Build the universal XCFramework
 #
 #    NOTE: Earlier versions of this script called
 #    compileAndBuildVLCKit.sh once per architecture/platform (expecting a
@@ -113,7 +188,6 @@ build_xcframework() {
 
   cd "${VLCKIT_DIR}"
 
-  export VLC_EXTRA_CONFIGURE_OPTS="${CONFIGURE_EXTRA_FLAGS[*]}"
   log "Building universal VLCKit.xcframework (device + simulator, arm64 + x86_64)..."
 
   # IMPORTANT: -f is required. Without it, BUILD_FRAMEWORK stays at its
@@ -137,7 +211,7 @@ build_xcframework() {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Package for SPM
+# 6. Package for SPM
 # ---------------------------------------------------------------------------
 package() {
   cd "${OUT_DIR}"
@@ -156,9 +230,22 @@ package() {
 
 main() {
   clone_latest
-  # verify_flags   # (commented out – uncomment if you want to check module names)
+  patch_vlc_build_conf
   build_xcframework
   package
+
+  # Sanity check: a correctly stripped build should land in roughly the
+  # 25-45 MB range documented in the README. If it's dramatically larger,
+  # the codec strip likely didn't take effect (e.g. build.conf wasn't
+  # found/patched as expected, or compileAndBuildVLCKit.sh re-cloned VLC
+  # over our patched checkout) and this needs investigating before
+  # trusting the release.
+  local zip_size_mb
+  zip_size_mb=$(du -m "${OUT_DIR}/VLCKit.xcframework.zip" | cut -f1)
+  log "Output zip size: ${zip_size_mb} MB (expected roughly 25-45 MB for a correctly stripped build)"
+  if (( zip_size_mb > 80 )); then
+    log "WARNING: output is much larger than expected -- the codec strip likely did not take effect. Check the build log for whether VLC was re-cloned (which would have discarded the patched build.conf) and whether the 'checking whether to enable' lines for x264/dvdnav/etc. in VLC's own configure output reflect the disable flags."
+  fi
 }
 
 main "$@"
